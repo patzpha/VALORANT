@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Soldado 3D - Mãos</title>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#9ec9e8;font-family:sans-serif;touch-action:none}
+#load{position:fixed;inset:0;display:flex;flex-direction:column;gap:14px;align-items:center;justify-content:center;background:#111;color:#fff;font-size:18px;z-index:9;text-align:center;padding:20px}
+#file{display:none}
+#info{position:fixed;top:10px;left:10px;color:#fff;background:#0007;padding:8px 12px;border-radius:8px;font-size:12px;line-height:1.5;pointer-events:none}
+#cam{position:fixed;top:10px;right:10px;display:flex;flex-direction:column;gap:6px;align-items:flex-end}
+#cam button{background:#000a;color:#fff;border:1px solid #fff6;border-radius:8px;padding:8px 10px;font-size:13px}
+#prev{width:150px;height:112px;background:#000;border-radius:8px;display:none}
+#joy{position:fixed;left:30px;bottom:30px;width:120px;height:120px;border-radius:50%;background:#fff3;border:2px solid #fff6;display:none}
+#knob{position:absolute;left:40px;top:40px;width:40px;height:40px;border-radius:50%;background:#fffb}
+#run{position:fixed;right:30px;bottom:40px;width:80px;height:80px;border-radius:50%;background:#fff4;border:2px solid #fff7;color:#fff;display:none;align-items:center;justify-content:center}
+</style></head><body>
+<div id="load"><div id="msg">Carregando soldado...</div><input type="file" id="file" accept=".glb,.gltf"></div>
+<div id="info">WASD/setas: andar • Shift: correr<br>Mouse: câmera • Roda: zoom • R: virar 180°<br>Mãos: ative a câmera (canto direito)</div>
+<div id="cam">
+<canvas id="prev" width="150" height="112"></canvas>
+<button id="bOn">Ativar câmera (mãos)</button>
+<button id="bSw">Câmera: traseira</button>
+<button id="bInv">Inverter mãos</button>
+</div>
+<video id="vid" playsinline muted style="display:none"></video>
+<div id="joy"><div id="knob"></div></div><div id="run">CORRER</div>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js"></script>
+<script>
+const MODEL='Personagens/modern_tactical_soldier_1.glb';
+const V3=THREE.Vector3,Q=THREE.Quaternion,M4=new THREE.Matrix4();
+const scene=new THREE.Scene();
+scene.background=new THREE.Color(0x9ec9e8);scene.fog=new THREE.Fog(0x9ec9e8,40,160);
+const cam=new THREE.PerspectiveCamera(60,innerWidth/innerHeight,0.1,500);
+const R=new THREE.WebGLRenderer({antialias:true});
+R.setPixelRatio(Math.min(devicePixelRatio,2));R.setSize(innerWidth,innerHeight);
+R.shadowMap.enabled=true;R.outputEncoding=THREE.sRGBEncoding;
+document.body.appendChild(R.domElement);
+scene.add(new THREE.HemisphereLight(0xffffff,0x667755,0.9));
+const sun=new THREE.DirectionalLight(0xffffff,0.9);
+sun.castShadow=true;sun.shadow.mapSize.set(2048,2048);
+Object.assign(sun.shadow.camera,{left:-25,right:25,top:25,bottom:-25,near:1,far:120});
+scene.add(sun,sun.target);
+const ground=new THREE.Mesh(new THREE.PlaneGeometry(1000,1000),new THREE.MeshStandardMaterial({color:0x5d8a4a,roughness:1}));
+ground.rotation.x=-Math.PI/2;ground.receiveShadow=true;scene.add(ground);
+const grid=new THREE.GridHelper(1000,500,0x000000,0x000000);
+grid.material.opacity=0.12;grid.material.transparent=true;grid.position.y=0.01;scene.add(grid);
+
+const player=new THREE.Group();scene.add(player);
+const lean=new THREE.Group();player.add(lean);
+const holder=new THREE.Group();lean.add(holder);
+holder.rotation.y=-Math.PI/2; // modelo olha para +X; direita do personagem = +Z
+let flip=0;
+
+// ---------- braços (cinemática inversa) + mãos ----------
+const mat3=()=>({value:new THREE.Matrix3()}),vec3=()=>({value:new V3()});
+const U={uPhase:{value:0},uAmp:{value:0},uTR:{value:0},uTL:{value:0},
+ uMuR:mat3(),uMfR:mat3(),uMuL:mat3(),uMfL:mat3(),uER:vec3(),uEL:vec3(),uWR:vec3(),uWL:vec3()};
+const CONN=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+const THICK=[[0,5],[5,9],[9,13],[13,17],[0,17],[0,1],[1,2]].map(String);
+const glove=new THREE.MeshStandardMaterial({color:0x222222,roughness:0.8});
+const unitCyl=new THREE.CylinderGeometry(1,1,1,8);
+function mkSide(sgn){
+  const S=new V3(.03,.27,.21*sgn),E=new V3(.04,.09,.24*sgn),W=new V3(.05,-.03,.25*sgn);
+  const grp=new THREE.Group();holder.add(grp);
+  const bones=CONN.map(c=>{const t=THICK.includes(String(c))?.011:.0075;
+    const m=new THREE.Mesh(unitCyl,glove);m.userData.r=t;m.scale.set(t,1,t);grp.add(m);return m});
+  const joints=[];for(let i=0;i<21;i++){const m=new THREE.Mesh(new THREE.SphereGeometry(i<=4&&i>0?.008:.0085,8,6),glove);grp.add(m);joints.push(m)}
+  return{sgn,S,E,W,a:E.distanceTo(S),b:W.distanceTo(E),trk:0,last:-9999,init:false,
+    T:W.clone(),Tt:W.clone(),vec:Array.from({length:21},()=>new V3()),vt:null,
+    Ep:E.clone(),Wp:W.clone(),qu:new Q(),qf:new Q(),grp,bones,joints};
+}
+const A={R:mkSide(1),L:mkSide(-1)};
+function solve(a){
+  const d0=a.T.clone().sub(a.S),L=d0.length();
+  const d=Math.min(Math.max(L,Math.abs(a.a-a.b)+.01),a.a+a.b-.005),u=d0.normalize();
+  const al=(a.a*a.a-a.b*a.b+d*d)/(2*d),h=Math.sqrt(Math.max(0,a.a*a.a-al*al));
+  const pole=new V3(0,-1,a.sgn*.7);pole.addScaledVector(u,-pole.dot(u)).normalize();
+  a.Ep=a.S.clone().addScaledVector(u,al).addScaledVector(pole,h);
+  a.Wp=a.S.clone().addScaledVector(u,d);
+  a.qu.setFromUnitVectors(a.E.clone().sub(a.S).normalize(),a.Ep.clone().sub(a.S).normalize());
+  a.qf.setFromUnitVectors(a.W.clone().sub(a.E).normalize(),a.Wp.clone().sub(a.Ep).normalize());
+}
+function updateHand(a,key){
+  U['uMu'+key].value.setFromMatrix4(M4.makeRotationFromQuaternion(a.qu));
+  U['uMf'+key].value.setFromMatrix4(M4.makeRotationFromQuaternion(a.qf));
+  U['uE'+key].value.copy(a.Ep);U['uW'+key].value.copy(a.Wp);U['uT'+key].value=a.trk;
+  a.grp.visible=a.trk>0.05;if(!a.grp.visible)return;
+  const P=a.vec.map(v=>v.clone().add(a.Wp)),Y=new V3(0,1,0);
+  a.joints.forEach((m,i)=>m.position.copy(P[i]));
+  CONN.forEach(([i,j],n)=>{const m=a.bones[n],d=P[j].clone().sub(P[i]),l=d.length();
+    m.position.copy(P[i]).addScaledVector(d,.5);m.quaternion.setFromUnitVectors(Y,d.normalize());m.scale.set(m.userData.r,l,m.userData.r)});
+}
+
+// ---------- shader: pernas, pés, braços e mãos ----------
+const DECL=`uniform float uPhase,uAmp,uTR,uTL;uniform mat3 uMuR,uMfR,uMuL,uMfL;uniform vec3 uER,uEL,uWR,uWL;
+mat2 rot2(float a){float c=cos(a),s=sin(a);return mat2(c,s,-s,c);}`;
+const BODY=`vec3 transformed=vec3(position);
+float yy=position.y;
+float sd=clamp(position.z/0.06,-1.,1.);
+float lw=1.-smoothstep(-0.12,-0.03,yy);
+float kw=(1.-smoothstep(-0.30,-0.24,yy))*lw;
+float cs=max(0.,cos(uPhase)*sd);
+float kb=-uAmp*1.1*cs*kw;
+float haf=uAmp*sin(uPhase)*sd;
+float kbf=-uAmp*1.1*cs;
+float ha=haf*lw;
+vec2 p=transformed.xy;
+p=rot2(kb)*(p-vec2(0.,-0.27))+vec2(0.,-0.27);
+p=rot2(ha)*(p-vec2(0.,-0.03))+vec2(0.,-0.03);
+vec2 ank=vec2(0.04,-0.43);
+ank=rot2(kbf)*(ank-vec2(0.,-0.27))+vec2(0.,-0.27);
+ank=rot2(haf)*(ank-vec2(0.,-0.03))+vec2(0.,-0.03);
+float fw=1.-smoothstep(-0.45,-0.39,yy);
+p=rot2(-(haf+kbf)*0.9*fw)*(p-ank)+ank;
+float am=smoothstep(0.17,0.21,abs(position.z))*(1.-smoothstep(0.22,0.30,yy))*smoothstep(-0.13,-0.08,yy);
+p=rot2(-uAmp*0.9*sin(uPhase)*sd*am)*(p-vec2(0.03,0.28))+vec2(0.03,0.28);
+transformed.xy=p;
+bool rt=position.z>0.;
+float trk=rt?uTR:uTL;
+mat3 Mu=rt?uMuR:uMuL;mat3 Mf=rt?uMfR:uMfL;
+vec3 Ep=rt?uER:uEL;vec3 Wp=rt?uWR:uWL;
+vec3 Sh=vec3(0.03,0.27,rt?0.21:-0.21);
+vec3 Er=vec3(0.04,0.09,rt?0.24:-0.24);
+vec3 pu=Sh+Mu*(position-Sh);
+vec3 pf=Ep+Mf*(position-Er);
+vec3 pik=mix(pf,pu,smoothstep(Er.y-0.03,Er.y+0.03,yy));
+float hh=step(0.2,abs(position.z))*step(yy,-0.025)*step(-0.14,yy);
+transformed=mix(transformed,pik,am*trk);
+transformed=mix(transformed,Wp,hh*trk);`;
+function inject(m){
+  m.onBeforeCompile=sh=>{Object.assign(sh.uniforms,U);
+    sh.vertexShader=sh.vertexShader.replace('#include <common>','#include <common>\n'+DECL).replace('#include <begin_vertex>',BODY)};
+  m.customProgramCacheKey=()=>'soldier-hands';
+}
+function setup(gltf){
+  const o=gltf.scene;o.updateMatrixWorld(true);
+  const meshes=[];o.traverse(m=>{if(m.isMesh)meshes.push(m)});
+  const box=new THREE.Box3();
+  meshes.forEach(m=>{
+    m.geometry.applyMatrix4(m.matrixWorld);m.geometry.computeBoundingBox();box.union(m.geometry.boundingBox);
+    m.position.set(0,0,0);m.rotation.set(0,0,0);m.scale.set(1,1,1);
+    m.castShadow=m.receiveShadow=true;m.frustumCulled=false;inject(m.material);
+    const dm=new THREE.MeshDepthMaterial({depthPacking:THREE.RGBADepthPacking});inject(dm);m.customDepthMaterial=dm;
+    holder.add(m);
+  });
+  const H=box.max.y-box.min.y,k=1.8/H;
+  holder.scale.setScalar(k);holder.position.y=-box.min.y*k;
+  document.getElementById('load').style.display='none';
+}
+const msg=document.getElementById('msg'),fileIn=document.getElementById('file');
+const parseBuf=b=>new THREE.GLTFLoader().parse(b,'',setup,e=>{msg.textContent='Erro ao ler o modelo';console.error(e)});
+fetch(MODEL).then(r=>{if(!r.ok)throw 0;return r.arrayBuffer()}).then(parseBuf)
+.catch(()=>{msg.textContent='Não achei '+MODEL+'. Escolha o arquivo:';fileIn.style.display='block'});
+fileIn.addEventListener('change',e=>{const f=e.target.files[0];if(!f)return;msg.textContent='Carregando...';fileIn.style.display='none';f.arrayBuffer().then(parseBuf)});
+
+// ---------- câmera + MediaPipe ----------
+const vid=document.getElementById('vid'),prev=document.getElementById('prev'),pc=prev.getContext('2d');
+let rear=true,inv=false,stream=null,hands=null,running=false,busy=false;
+const clamp=(x,a,b)=>Math.min(b,Math.max(a,x));
+function feed(a,lm,w0,h0){
+  const s=rear?1:-1,w=lm[0],m=lm[9];
+  const hsz=Math.hypot((m.x-w.x)*w0,(m.y-w.y)*h0)/w0,f=0.05/(hsz*w0);
+  a.vt=lm.map(p=>new V3(s*(p.z-w.z)*w0*f,-(p.y-w.y)*h0*f,s*(p.x-w.x)*w0*f));
+  const fx=rear?clamp((0.2-hsz)*4,0,.5):clamp((hsz-0.08)*4,0,.5);
+  a.Tt.set(.05+fx,.12+(.5-w.y)*.9,.1*a.sgn+s*(w.x-.5)*.8);
+  if(!a.init){a.init=true;a.T.copy(a.Tt);a.vec.forEach((v,i)=>v.copy(a.vt[i]))}
+  a.last=performance.now();
+}
+function onResults(r){
+  prev.style.display='block';prev.style.transform=rear?'none':'scaleX(-1)';
+  pc.drawImage(r.image,0,0,prev.width,prev.height);
+  const hs=r.multiHandLandmarks||[],hd=r.multiHandedness||[];
+  let sides=hs.map((_,i)=>((hd[i].label==='Right')!==inv)?'R':'L');
+  if(hs.length===2){const first=((hs[0][0].x>hs[1][0].x)===rear)!==inv?'R':'L';sides=[first,first==='R'?'L':'R']}
+  pc.fillStyle='#0f0';
+  hs.forEach((lm,i)=>{feed(A[sides[i]],lm,r.image.width,r.image.height);
+    lm.forEach(p=>pc.fillRect(p.x*prev.width-1,p.y*prev.height-1,3,3))});
+}
+async function startCam(){
+  try{
+    if(stream)stream.getTracks().forEach(t=>t.stop());
+    stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:rear?'environment':'user',width:640,height:480},audio:false});
+    vid.srcObject=stream;await vid.play();
+    if(!hands){hands=new Hands({locateFile:f=>'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/'+f});
+      hands.setOptions({maxNumHands:2,modelComplexity:1,minDetectionConfidence:.6,minTrackingConfidence:.6});
+      hands.onResults(onResults)}
+    if(!running){running=true;tick()}
+  }catch(e){alert('Não consegui abrir a câmera: '+e.message)}
+}
+async function tick(){
+  if(vid.readyState>=2&&!busy){busy=true;try{await hands.send({image:vid})}catch(e){}busy=false}
+  requestAnimationFrame(tick);
+}
+const bSw=document.getElementById('bSw');
+document.getElementById('bOn').onclick=startCam;
+bSw.onclick=()=>{rear=!rear;inv=!rear?true:false;bSw.textContent='Câmera: '+(rear?'traseira':'frontal');if(running)startCam()};
+document.getElementById('bInv').onclick=()=>{inv=!inv};
+
+// ---------- controles ----------
+const keys={};
+addEventListener('keydown',e=>{keys[e.code]=true;if(e.code==='KeyR')flip+=Math.PI});
+addEventListener('keyup',e=>keys[e.code]=false);
+let yaw=0,pitch=0.35,dist=5;
+function look(dx,dy){yaw-=dx*0.005;pitch=clamp(pitch+dy*0.005,-0.2,1.2)}
+R.domElement.addEventListener('click',()=>{if(!('ontouchstart' in window))R.domElement.requestPointerLock()});
+addEventListener('mousemove',e=>{if(document.pointerLockElement)look(e.movementX,e.movementY)});
+addEventListener('wheel',e=>{dist=clamp(dist+e.deltaY*0.01,2,12)});
+const joy=document.getElementById('joy'),knob=document.getElementById('knob'),runB=document.getElementById('run');
+let jv={x:0,y:0},jid=null,lid=null,lx=0,ly=0,tRun=false;
+if('ontouchstart' in window){joy.style.display='block';runB.style.display='flex'}
+runB.addEventListener('touchstart',e=>{tRun=true;e.preventDefault()});
+runB.addEventListener('touchend',()=>tRun=false);
+addEventListener('touchstart',e=>{for(const t of e.changedTouches){
+  if(t.target.closest('#cam'))continue;
+  if(t.clientX<innerWidth/2&&jid===null&&t.clientY>innerHeight/2){jid=t.identifier}
+  else if(t.clientX>=innerWidth/2&&lid===null&&!runB.contains(t.target)){lid=t.identifier;lx=t.clientX;ly=t.clientY}}});
+addEventListener('touchmove',e=>{for(const t of e.changedTouches){
+  if(t.identifier===jid){const r=joy.getBoundingClientRect();
+    let x=(t.clientX-(r.left+60))/50,y=(t.clientY-(r.top+60))/50,l=Math.hypot(x,y);
+    if(l>1){x/=l;y/=l}jv={x,y};knob.style.transform=`translate(${x*40}px,${y*40}px)`}
+  else if(t.identifier===lid){look(t.clientX-lx,t.clientY-ly);lx=t.clientX;ly=t.clientY}}});
+addEventListener('touchend',e=>{for(const t of e.changedTouches){
+  if(t.identifier===jid){jid=null;jv={x:0,y:0};knob.style.transform=''}
+  if(t.identifier===lid)lid=null}});
+addEventListener('resize',()=>{cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix();R.setSize(innerWidth,innerHeight)});
+
+const clock=new THREE.Clock();let face=0,amp=0,tilt=0;
+function loop(){
+  requestAnimationFrame(loop);
+  const dt=Math.min(clock.getDelta(),0.05),k=1-Math.exp(-dt*16);
+  for(const key of ['R','L']){
+    const a=A[key],on=a.vt&&performance.now()-a.last<400;
+    a.trk+=((on?1:0)-a.trk)*Math.min(1,dt*8);
+    if(on){a.T.lerp(a.Tt,k);a.vec.forEach((v,i)=>v.lerp(a.vt[i],k))}
+    solve(a);updateHand(a,key);
+  }
+  let f=(keys.KeyW||keys.ArrowUp?1:0)-(keys.KeyS||keys.ArrowDown?1:0)-jv.y;
+  let r=(keys.KeyD||keys.ArrowRight?1:0)-(keys.KeyA||keys.ArrowLeft?1:0)+jv.x;
+  const len=Math.hypot(f,r),moving=len>0.05;
+  const running_=moving&&(keys.ShiftLeft||keys.ShiftRight||tRun);
+  let targetAmp=0,targetTilt=0;
+  if(moving){
+    if(len>1){f/=len;r/=len}
+    const sp=running_?6:2.6,dx=-Math.sin(yaw),dz=-Math.cos(yaw);
+    const vx=dx*f+Math.cos(yaw)*r,vz=dz*f-Math.sin(yaw)*r;
+    player.position.x+=vx*sp*dt;player.position.z+=vz*sp*dt;
+    let d=Math.atan2(vx,vz)-face;d=Math.atan2(Math.sin(d),Math.cos(d));face+=d*Math.min(1,dt*12);
+    U.uPhase.value+=dt*(running_?11:8);
+    targetAmp=running_?0.6:0.38;targetTilt=running_?0.15:0.04;
+  }
+  amp+=(targetAmp-amp)*Math.min(1,dt*10);tilt+=(targetTilt-tilt)*Math.min(1,dt*8);
+  U.uAmp.value=amp;U.uTR.value=A.R.trk;U.uTL.value=A.L.trk;
+  lean.rotation.x=tilt;
+  lean.position.y=-0.75*(1-Math.cos(amp*Math.abs(Math.sin(U.uPhase.value))));
+  player.rotation.y=face+flip;
+  const p=player.position;
+  cam.position.set(p.x+Math.sin(yaw)*Math.cos(pitch)*dist,Math.max(0.3,1.5+Math.sin(pitch)*dist),p.z+Math.cos(yaw)*Math.cos(pitch)*dist);
+  cam.lookAt(p.x,1.4,p.z);
+  sun.position.set(p.x+20,40,p.z+15);sun.target.position.copy(p);
+  R.render(scene,cam);
+}
+loop();
+</script></body></html>
